@@ -1,0 +1,4 @@
+{"source":"claude-code","v":1,"kind":"finished","event":"Stop","mode":"cloud","agent":"<TU_SLUG>",
+ "session_id":"...","session_url":"https://claude.ai/code/session_...",
+ "repo":"<owner>/<repo>","branch":"fix/login","pr_url":"https://github.com/<owner>/<repo>/pull/42",
+ "summary":"Listo: arreglé el login... ","ts":"2026-10-17T22:00:00Z"}

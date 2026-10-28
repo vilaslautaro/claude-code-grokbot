@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.claude/hooks/wake.sh\"", "timeout": 40 } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.claude/hooks/wake.sh\"", "timeout": 40 } ] }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input",
+        "hooks": [ { "type": "command", "command": "bash \"$HOME/.claude/hooks/wake.sh\"", "timeout": 40 } ]
+      }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.claude/hooks/wake.sh\"", "timeout": 40 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.claude/hooks/wake.sh\"", "timeout": 20 } ] }
+    ]
+  }
+}

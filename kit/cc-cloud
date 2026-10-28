@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# cc-cloud: lanza una tarea en Claude Code en la nube (claude.ai/code) para un bot de Grok Bot.
+#   cc-cloud --agent <slug> [--model sonnet|opus] [--env env_...] [--dir <repo>] --file brief.md
+#   cc-cloud --agent <slug> -- "<tarea>"
+#   cc-cloud --send <session_url> -- "<mensaje>"      # seguir una sesión existente
+# Imprime una línea JSON: {"ok":true,"session_url":"...","log":"..."}
+# El environment de cada bot sale de --env o de ~/.config/cc-wake/cloud-envs (líneas slug=env_...).
+set -uo pipefail
+claude_bin="${CC_CLAUDE_BIN:-claude}"
+config_dir="${WAKE_CONFIG_DIR:-$HOME/.config/cc-wake}"
+state_dir="${WAKE_STATE_DIR:-$HOME/.local/state/cc-wake}"
+claude_json="${CLAUDE_JSON:-$HOME/.claude.json}"
+command -v jq >/dev/null || { echo '{"ok":false,"error":"falta jq"}'; exit 1; }
+die() { jq -nc --arg e "$*" '{ok:false, error:$e}'; exit 1; }
+
+agent="" model="" env_id="" dir="$PWD" file="" send="" task=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) agent=${2:-}; shift 2 ;;
+    --model) model=${2:-}; shift 2 ;;
+    --env)   env_id=${2:-}; shift 2 ;;
+    --dir)   dir=${2:-}; shift 2 ;;
+    --file)  file=${2:-}; shift 2 ;;
+    --send)  send=${2:-}; shift 2 ;;
+    --) shift; task="$*"; break ;;
+    *) die "argumento desconocido: $1" ;;
+  esac
+done
+[ -n "$file" ] && { [ -r "$file" ] || die "no puedo leer $file"; task=$(cat "$file"); }
+[ -n "$task" ] || die "falta la tarea (-- \"...\" o --file)"
+mkdir -p "$state_dir/launch" && chmod 700 "$state_dir" "$state_dir/launch"
+log="$state_dir/launch/$(date +%Y%m%d-%H%M%S)-$$.log"
+
+# Seguir una sesión: no necesita TTY.
+if [ -n "$send" ]; then
+  out=$("$claude_bin" -p "$task" --cloud "$send" --output-format json </dev/null 2>"$log")
+  if [ -n "$out" ]; then printf '%s\n' "$out"; else jq -nc --arg l "$log" '{ok:false, error:"sin salida", log:$l}'; fi
+  exit 0
+fi
+
+[[ "$agent" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] || die "--agent tiene que ser un slug [a-z0-9-]"
+[ -z "$model" ] || [[ "$model" =~ ^[A-Za-z0-9._-]+$ ]] || die "--model inválido"
+dir=$(cd "$dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || die "$dir no es un repo git"
+
+# La nube clona el remote: avisar si la rama no está pusheada.
+branch=$(git -C "$dir" symbolic-ref --short -q HEAD || true) warn=""
+if [ -n "$branch" ]; then
+  git -C "$dir" fetch -q origin "$branch" 2>/dev/null || true
+  if ! git -C "$dir" rev-parse -q --verify "origin/$branch" >/dev/null; then
+    warn="la rama $branch no está en origin; la nube va a usar otra base"
+  elif [ "$(git -C "$dir" rev-parse HEAD)" != "$(git -C "$dir" rev-parse "origin/$branch")" ]; then
+    warn="HEAD local distinto de origin/$branch; pusheá antes si querés esos commits"
+  fi
+fi
+
+# Environment de este bot, para que el aviso vaya a SU webhook.
+if [ -z "$env_id" ] && [ -r "$config_dir/cloud-envs" ]; then
+  env_id=$(sed -n -E "s/^[[:space:]]*${agent}[[:space:]]*=[[:space:]]*(env_[A-Za-z0-9]+)[[:space:]]*$/\\1/p" "$config_dir/cloud-envs" | tail -n 1)
+fi
+[ -z "$env_id" ] || [[ "$env_id" =~ ^env_[A-Za-z0-9]+$ ]] || die "--env tiene que ser env_..."
+
+# Gotcha: el diálogo "trust this folder" cuelga el primer lanzamiento sin TTY real. Se pre-acepta.
+if [ -s "$claude_json" ]; then
+  tmp=$(mktemp "${claude_json}.XXXXXX") &&
+    jq --arg d "$dir" '.projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' \
+      "$claude_json" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$claude_json" || rm -f "$tmp"
+fi
+
+prompt=$(printf 'notify: %s\n%s' "$agent" "$task")
+cmd=("$claude_bin")
+[ -n "$model" ] && cmd+=(--model "$model")
+[ -n "$env_id" ] && cmd+=(--settings "{\"remote\":{\"defaultEnvironmentId\":\"$env_id\"}}")
+cmd+=(--cloud "$prompt")
+
+# claude --cloud necesita una pseudo-TTY: se envuelve en `script`.
+quoted=$(printf '%q ' "${cmd[@]}")
+( cd "$dir" && SHELL=/bin/bash timeout "${CC_CLOUD_TIMEOUT:-300}" script -qec "$quoted" /dev/null </dev/null ) >"$log" 2>&1
+code=$?
+chmod 600 "$log"
+clean=$(sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\x1b\][^\x07]*\x07//g' "$log" | tr -d '\r')
+url=$(printf '%s' "$clean" | grep -Eo 'https://claude\.ai/code/(session|cse)_[A-Za-z0-9]+' | head -n 1)
+if [ -n "$url" ]; then
+  jq -nc --arg u "$url" --arg l "$log" --arg w "$warn" --arg e "$env_id" --arg a "$agent" \
+    '{ok:true, agent:$a, session_url:$u, environment:$e, log:$l} + (if $w != "" then {warning:$w} else {} end)'
+else
+  jq -nc --arg l "$log" --argjson c "$code" --arg t "$(printf '%s' "$clean" | tail -n 5)" \
+    '{ok:false, exit:$c, error:"no encontré el link de la sesión", tail:$t, log:$l}'
+  exit 1
+fi

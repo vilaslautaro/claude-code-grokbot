@@ -1,0 +1,3 @@
+# ~/.config/cc-wake/cloud-envs en la compu del bot: una línea por bot, slug=env_...
+# el id sale de: claude → /remote-env → elegís el environment (queda en ~/.claude/settings.json). no es secreto.
+<TU_SLUG>=<TU_ENV_ID>

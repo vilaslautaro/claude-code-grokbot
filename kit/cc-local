@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# cc-local: fallback local. Corre `claude -p` en la compu de los bots, en un worktree por tarea,
+# en segundo plano, con el hook de aviso cargado por --settings (no toca ~/.claude/settings.json).
+#   cc-local --agent <slug> --dir <repo> --branch feature/x [--base develop] [--model m] --file brief.md
+# Necesita ~/.config/cc-wake/agents/<slug>.env (modo 600) con WAKE_URL=... y la key en
+# ~/.config/cc-wake/agents/<slug>.key (modo 600). Nunca pushea ni mergea por su cuenta.
+set -uo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+claude_bin="${CC_CLAUDE_BIN:-claude}"
+cfg="${WAKE_CONFIG_DIR:-$HOME/.config/cc-wake}"
+state_dir="${WAKE_STATE_DIR:-$HOME/.local/state/cc-wake}"
+wt_root="${CC_WORKTREES:-$HOME/cc-worktrees}"
+die() { jq -nc --arg e "$*" '{ok:false, error:$e}'; exit 1; }
+
+agent="" dir="" branch="" base="" model="" file="" task=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) agent=${2:-}; shift 2 ;;  --dir) dir=${2:-}; shift 2 ;;
+    --branch) branch=${2:-}; shift 2 ;; --base) base=${2:-}; shift 2 ;;
+    --model) model=${2:-}; shift 2 ;;  --file) file=${2:-}; shift 2 ;;
+    --) shift; task="$*"; break ;;
+    *) die "argumento desconocido: $1" ;;
+  esac
+done
+[ -n "$file" ] && { [ -r "$file" ] || die "no puedo leer $file"; task=$(cat "$file"); }
+[ -n "$task" ] || die "falta la tarea"
+[[ "$agent" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] || die "--agent tiene que ser un slug [a-z0-9-]"
+git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "--branch inválida"
+case "$branch" in main|master|dev|develop) die "usá una rama de tarea, no $branch" ;; esac
+dir=$(cd "${dir:-$PWD}" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || die "--dir no es un repo git"
+WAKE_URL=$(sed -n -E 's/^WAKE_URL=(https:\/\/[^[:space:]]+)$/\1/p' "$cfg/agents/$agent.env" 2>/dev/null | tail -n 1)
+[ -n "$WAKE_URL" ] || die "falta WAKE_URL en $cfg/agents/$agent.env"
+
+wt="$wt_root/$(basename "$dir")/$(printf '%s' "$branch" | tr '/' '-')"
+if [ ! -d "$wt" ]; then
+  mkdir -p "$(dirname "$wt")"; git -C "$dir" fetch -q origin 2>/dev/null || true
+  if git -C "$dir" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+    git -C "$dir" worktree add -q "$wt" "$branch" || die "no pude crear el worktree"
+  elif git -C "$dir" rev-parse -q --verify "origin/$branch" >/dev/null; then
+    git -C "$dir" worktree add -q -b "$branch" "$wt" "origin/$branch" || die "no pude crear el worktree"
+  else
+    start="origin/${base:-HEAD}"; git -C "$dir" rev-parse -q --verify "$start" >/dev/null || start=${base:-HEAD}
+    git -C "$dir" worktree add -q -b "$branch" "$wt" "$start" || die "no pude crear el worktree"
+  fi
+fi
+
+mkdir -p "$state_dir/runs" && chmod 700 "$state_dir" "$state_dir/runs"
+run="$state_dir/runs/$(date +%Y%m%d-%H%M%S)-$$"
+# Mismos eventos que en la nube, apuntando a este wake.sh.
+jq --arg c "bash $(printf '%q' "$here/wake.sh")" '(.hooks[][]?.hooks[]?.command) = $c' "$here/settings.json" >"$run.settings.json"
+prompt=$(printf 'notify: %s\n%s' "$agent" "$task")
+cmd=("$claude_bin" -p "$prompt" --settings "$run.settings.json" --permission-mode "${CC_LOCAL_PERMISSION_MODE:-acceptEdits}" --output-format json)
+[ -n "$model" ] && cmd+=(--model "$model")
+
+( export NOTIFY_AGENT="$agent" WAKE_URL WAKE_KEY_FILE="$cfg/agents/$agent.key" WAKE_STATE_DIR="$state_dir"
+  cd "$wt" && "${cmd[@]}" </dev/null >"$run.out" 2>>"$run.log"; echo "exit=$?" >>"$run.log"
+  rm -f "$run.settings.json" ) >/dev/null 2>&1 </dev/null &
+jq -nc --arg w "$wt" --arg l "$run.log" --argjson p "$!" --arg a "$agent" '{ok:true, agent:$a, pid:$p, worktree:$w, log:$l}'
